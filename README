@@ -2,7 +2,7 @@ NAME
     HTML::Acid - Reformat HTML fragment to strict criteria
 
 VERSION
-    This document describes HTML::Acid version 0.0.1
+    This document describes HTML::Acid version 0.0.2
 
 SYNOPSIS
         use HTML::Acid;
@@ -38,10 +38,9 @@ DESCRIPTION
     *   Images must have "src", "title", "alt", "height" and "width"
         attributes. The "src" attribute must match the same regular
         expression as "href". If any of these tags are missing the image is
-        replaced by the contents of the "alt" attribute, so long as either
-        the *text_manip* parameter is set or it consists only of
-        alphanumeric characters, spaces, full stops and commas. Otherwise
-        the image is removed.
+        replaced by the contents of the "alt" attribute, so long as it
+        consists only of alphanumeric characters, spaces, full stops and
+        commas. Otherwise the image is removed.
 
     *   All other tags must have no attributes and may only contain text.
 
@@ -121,7 +120,7 @@ BUGS AND LIMITATIONS
 
 SEE ALSO
     There are many other modules that do something similar. Of those I think
-    the most complete is HTML::StriptScripts::Parser. You can also see
+    the most complete is HTML::StripScripts::Parser. You can also see
     HTML::Declaw, HTML::Clean, HTML::Defang, HTML::Restrict, HTML::Scrubber,
     HTML::Laundary, HTML::Detoxifier, Marpa::HTML, HTML::Tidy. People also
     often refer to HTML::Santitizer.

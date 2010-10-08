@@ -11,7 +11,7 @@ WriteMakefile
                            'Readonly' => 0,
                            'String::Dirify' => 0,
                            'Test::Differences' => 0,
-                           'Test::More' => 0,
+                           'Test::More' => '0.94',
                            'Test::NoWarnings' => 0,
                            'version' => 0
                          },
