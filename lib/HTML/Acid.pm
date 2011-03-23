@@ -8,7 +8,7 @@ use Readonly;
 use HTML::Acid::Buffer;
 use String::Dirify qw(dirify);
 
-use version; our $VERSION = qv('0.0.2');
+use version; our $VERSION = qv('0.0.3');
 
 # Module implementation here
 
@@ -62,13 +62,8 @@ sub new {
         $url_regex = $URL_REGEX;
     }
 
-    my @tags = sort {
-        # sort like this so that the later depth calcs do not
-        # loop for ever.
-        $tag_hierarchy->{$a} cmp $tag_hierarchy->{$b}
-    } keys %$tag_hierarchy;
-
-    # Configue HTML::Prser options
+    # Configue HTML::Parser options
+    my @tags = keys %$tag_hierarchy;
     my $self = HTML::Parser->new(
         api_version => 3,
         empty_element_tags=>1,
@@ -85,28 +80,92 @@ sub new {
         report_tags=>[@tags, 'br'],
     );
 
-    # calculate depths
-    $self->{_acid_depths}->{''} = 0;
-    while(@tags) {
-        my $tag = shift @tags;
-        my $value = $tag_hierarchy->{$tag};
-        if (exists $self->{_acid_depths}->{$value}) {
-            $self->{_acid_depths}->{$tag}
-                = $self->{_acid_depths}->{$value} + 1;
-        }
-        else {
-            push @tags, $tag;
-        }
-    }
-    $self->{_acid_tag_hierarchy} = $tag_hierarchy;
+    bless $self, $class;
+
+    # Calculate depths and normalize hierarchy
+    $self->{_acid_depths} = {''=>0};
+    $self->{_acid_tag_hierarchy} = {};
+    $self->{_acid_preferred_parent} = {};
+    my %pending = ();
+    $self->_process_tags(\%pending, $tag_hierarchy, @tags);
+
     $self->{_acid_url_regex} = $url_regex;
     foreach my $arg (keys %args) {
         $self->{"_acid_$arg"} = $args{$arg};
     }
 
-    bless $self, $class;
     return $self;
 }
+
+sub _process_tags {
+    my ($self, $pending, $tag_hierarchy, @tags) = @_;
+
+TAG:
+    foreach my $tag (@tags) {
+
+        # Get a list of parents for this tag
+        my @parents  = (ref $tag_hierarchy->{$tag} eq 'ARRAY')
+                     ? @{$tag_hierarchy->{$tag}}
+                     : ( $tag_hierarchy->{$tag} );
+
+        # Get the maximum depth of the parents
+        # If this is not possible dump the problem tag, parent on the 
+        # pending queue
+        my $depth = undef;
+        my $preferred_parent = undef;
+PARENT:
+        foreach my $p (@parents) {
+            if (exists $self->{_acid_depths}->{$p}) {
+                my $p_depth = $self->{_acid_depths}->{$p};
+                if (not defined $depth) {
+                    $depth = $p_depth;
+                    $preferred_parent = $p;
+                }
+                elsif ($p_depth < $depth) {
+                    $preferred_parent = $p;
+                }
+                else {
+                    $depth = $p_depth;
+                }
+                $self->{_acid_tag_hierarchy}->{$tag}->{$p} = 1;
+            }
+            else {
+                _push_tag($pending, $p, $tag);
+                next TAG;
+            }
+        }
+        $self->{_acid_depths}->{$tag} = $depth+1;
+        $self->{_acid_preferred_parent}->{$tag} = $preferred_parent;
+
+        # If we get this far we know the depth of $tag.
+        # So we can go back and look at all the tags 
+        # that were waiting for $tag.
+        my @heldback = _pop_tag($pending, $tag);
+        $self->_process_tags($pending, $tag_hierarchy, @heldback);
+    }
+    return;
+}
+
+sub _push_tag {
+    my $pending = shift;
+    my $parent = shift;
+    my $tag = shift;
+    if ($pending->{$parent}) {
+        push @{$pending->{$parent}}, $tag;
+    }
+    else {
+        $pending->{$parent} = [$tag];
+    }
+    return;
+}
+
+sub _pop_tag {
+    my $pending = shift;
+    my $parent = shift;
+    return if not exists $pending->{$parent};
+    my $array = delete $pending->{$parent};
+    return @$array;
+}   
 
 sub _text_process {
     my $self = shift;
@@ -120,8 +179,7 @@ sub _text_process {
 
     # To add to the buffer unhindered we must not be in the 
     # start state.
-    my $actual_state = $self->{_acid_state};
-    if ($actual_state eq '' and $text_nontrivial) {
+    if ($self->_get_state eq '' and $text_nontrivial) {
         $self->_start_process('p', {});
     }
 
@@ -138,7 +196,7 @@ sub _start_process {
     my $tagname = shift;
     my $attr = shift;
 
-    my $actual_state = $self->{_acid_state};
+    my $actual_state = $self->_get_state;
 
     #  Two br tags in a row means 'new paragraph'.
     if ($tagname eq 'br') {
@@ -157,14 +215,14 @@ sub _start_process {
     # To call _start_process unhindered
     # the parent tag of $tagname must be the
     # current state.
-    my $required_state = $self->{_acid_tag_hierarchy}->{$tagname};
-    if ($required_state ne $actual_state) {
-        my $required_depth = $self->{_acid_depths}->{$required_state};
+    if (not exists $self->{_acid_tag_hierarchy}->{$tagname}->{$actual_state}) {
+        my $required_state = $self->{_acid_preferred_parent}->{$tagname};
+        my $required_depth = $self->{_acid_depths}->{$tagname};
         my $actual_depth = $self->{_acid_depths}->{$actual_state};
         if ($actual_depth >= $required_depth) {
             $self->_end_process($actual_state);
         }
-        if ($required_state) {
+        if ($required_state ne '') {
             $self->_start_process($required_state, {});
         }
     }
@@ -179,7 +237,7 @@ sub _start_process {
 
     # State shifts to the current tag.
     # The 'img' end tag does not get called in some cases.
-    $self->{_acid_state} = $tagname if $tagname ne 'img';
+    $self->_push_state($tagname) if $tagname ne 'img';
 
     return;
 }
@@ -191,7 +249,7 @@ sub _end_process {
 
     # To call _start_process unhindered
     # $tagname must be the current state.
-    my $actual_state = $self->{_acid_state};
+    my $actual_state = $self->_get_state;
     if ($tagname ne $actual_state) {
         my $tag_depth = $self->{_acid_depths}->{$tagname};
         my $actual_depth = $self->{_acid_depths}->{$actual_state};
@@ -208,7 +266,7 @@ sub _end_process {
     }
 
     # State shifts to the parent tag.
-    $self->{_acid_state} = $self->{_acid_tag_hierarchy}->{$tagname};
+    $self->_pop_state;
 
     return;
 }
@@ -217,8 +275,7 @@ sub _end_document {
     my $self = shift;
 
     # We want to end in the start state.
-    my $actual_state = $self->{_acid_state};
-    if ($actual_state ne '') {
+    if ($self->_get_state ne '') {
         $self->_end_process('p');
         $self->_buffer("\n");
     }
@@ -242,12 +299,24 @@ sub _img_start {
     elsif ($self->{_acid_text_manip}) {
         my $otext = $alt;
         $otext = &{$self->{_acid_text_manip}}($alt);
-        $self->_buffer(" $otext ");
+        $self->_buffer($self->_text_container($otext));
     }
     elsif ($alt =~ $ALT_REGEX) {
-       $self->_buffer(" $alt ");
+       $self->_buffer($self->_text_container($alt));
     }
     return;
+}
+
+sub _text_container {
+    my $self = shift;
+    my $text = shift;
+    if ($self->{_acid_text_container}) {
+        $text = &{$self->{_acid_text_container}}($text);
+    }
+    else {
+        $text = " $text ";
+    }
+    return $text;
 }
 
 sub _url {
@@ -340,9 +409,26 @@ sub _buffer {
 sub _reset {
     my $self = shift;
     $self->{_acid_buffer} = [HTML::Acid::Buffer->new];
-    $self->{_acid_state} = "";
+    $self->{_acid_state} = [""];
     $self->{_acid_br} = 0;
     return;
+}
+
+sub _get_state {
+    my $self = shift;
+    return $self->{_acid_state}->[0];
+}
+
+sub _push_state {
+    my $self = shift;
+    my $state = shift;
+    unshift @{$self->{_acid_state}}, $state;
+    return;
+}
+
+sub _pop_state {
+    my $self = shift;
+    return shift @{$self->{_acid_state}};
 }
 
 sub burn {
@@ -373,7 +459,7 @@ HTML::Acid - Reformat HTML fragment to strict criteria
 
 =head1 VERSION
 
-This document describes HTML::Acid version 0.0.2
+This document describes HTML::Acid version 0.0.3
 
 =head1 SYNOPSIS
 
@@ -456,8 +542,14 @@ without width attributes will be rejected.
 
 =item I<text_manip>
 
-If set this must be subroutine reference. It takes text (and the C<alt> attribute from
-invalid images) and what is returned will be used instead.
+If set this must be subroutine reference. It takes text (and the C<alt>
+attribute from invalid images) and what is returned will be used instead.
+
+=item I<text_container>
+
+If set this must be subroutine reference. It takes the C<alt> (modified by
+I<text_manip> if present) and returns what would be used in the event of
+an invalid image.
 
 =back
 
@@ -482,6 +574,34 @@ mapping is as follows:
         strong => 'p',
     }
 
+Mapping an element onto the empty string implies that the element appears
+at the top-level of an HTML fragment. So for example
+
+    h3 => '',
+    p => '',
+
+implies that <h3> and <p> can be at the top of the document fragment. Mapping
+onto another element implies that the element must always be contained within
+that element. So
+
+    a => 'p',
+    img => 'p',
+    em => 'p',
+    strong => 'p',
+    
+implies that <a>, <img>, <em> and <strong> must be within a <p> element. It
+is also possible to specify alternatives:
+
+    img => ['p','a'],
+
+which implies that <img> can be within a <p> or an <a>. Note that this
+code does not check for loops. So doing something like
+
+    div => 'span',
+    span => 'div',
+
+is unsupported.
+
 =head1 CONFIGURATION AND ENVIRONMENT
 
 HTML::Acid requires no configuration files or environment variables.
@@ -500,10 +620,11 @@ None reported.
 
 =over 
 
-=item * Sooner or later a little more flexibility in handling attributes 
-will be required.
-
 =item * I think this module could do with an XS back-end for a speed up.
+
+=item * There is one bit of the code that the test scripts are not currently
+covering. I need some time to think of a reasonably plausible configuration
+that will trigger those cases.
 
 =back
 
@@ -529,7 +650,11 @@ Nicholas Bamber  C<< <nicholas@periapt.co.uk> >>
 
 =head1 LICENCE AND COPYRIGHT
 
-Copyright (c) 2010, Nicholas Bamber C<< <nicholas@periapt.co.uk> >>. All rights reserved.
+Copyright (c) 2010-2011, Nicholas Bamber C<< <nicholas@periapt.co.uk> >>.
+All rights reserved.
+
+The unordered list in the test files C<(t/*/5*)> is issued under the
+Creative Common Attribution-ShareAlike 3.0 Unported License (wikipedia).
 
 This module is free software; you can redistribute it and/or
 modify it under the same terms as Perl itself. See L<perlartistic>.
